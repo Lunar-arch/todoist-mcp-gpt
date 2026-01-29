@@ -610,6 +610,24 @@ export async function POST(req: NextRequest) {
           }
         }
 
+        // Handle initialization/ping
+        else if (method === 'initialize') {
+          responseData = {
+            protocolVersion: '2024-11-05',
+            capabilities: {
+              tools: {}
+            },
+            serverInfo: {
+              name: 'todoist-mcp',
+              version: '1.0.0'
+            }
+          };
+        }
+
+        else if (method === 'ping') {
+          responseData = {};
+        }
+
         else {
           throw new Error('Unknown method');
         }
