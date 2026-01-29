@@ -818,10 +818,18 @@ export async function OPTIONS() {
 }
 
 export async function GET(req: NextRequest) {
-  const sessionId = crypto.randomUUID();
+  // Allow a client-provided sessionId (helps reconnect/resume), otherwise create one.
+  const providedSessionId = req.nextUrl.searchParams.get('sessionId') || undefined;
+  const sessionId = providedSessionId && providedSessionId.length > 0 ? providedSessionId : crypto.randomUUID();
+
+  // Vercel serverless functions have a hard timeout (commonly 300s).
+  // Close the SSE stream a bit earlier so clients can reconnect cleanly.
+  const MAX_SSE_MS = 250_000;
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
+      let closed = false;
+
       // MCP SSE handshake: provide the message endpoint.
       const endpointUrl = `${req.nextUrl.origin}${req.nextUrl.pathname}?sessionId=${encodeURIComponent(sessionId)}`;
       controller.enqueue(sseEvent('endpoint', endpointUrl));
@@ -853,9 +861,29 @@ export async function GET(req: NextRequest) {
         }
       }, 15000);
 
-      const abort = () => {
+      const closeTimer = setTimeout(() => {
+        if (closed) return;
+        closed = true;
+        try {
+          controller.enqueue(sseComment('closing'));
+        } catch {
+          // no-op
+        }
         clearInterval(drainInterval);
         clearInterval(pingInterval);
+        try {
+          controller.close();
+        } catch {
+          // no-op
+        }
+      }, MAX_SSE_MS);
+
+      const abort = () => {
+        if (closed) return;
+        closed = true;
+        clearInterval(drainInterval);
+        clearInterval(pingInterval);
+        clearTimeout(closeTimer);
         try {
           controller.close();
         } catch {
@@ -944,16 +972,33 @@ export async function POST(req: NextRequest) {
     async start(controller) {
       let body: any;
       try {
-        body = await parseJsonBody(req);
+        body = (await parseJsonBody(req)) as JsonRpcRequest;
         const method = body?.method;
         const params = body?.params;
-        if (!method) throw new Error('Invalid Request');
+        const id: JsonRpcId = body?.id ?? null;
+        const hasId = !!body && Object.prototype.hasOwnProperty.call(body, 'id');
+
+        if (!method) {
+          const err = jsonRpcError(hasId ? id : null, -32600, 'Invalid Request');
+          controller.enqueue(sseEvent('message', err));
+          controller.close();
+          return;
+        }
+
+        // Notifications: no id, no response.
+        if (!hasId) {
+          await handleMcpMethod(method, params);
+          controller.close();
+          return;
+        }
 
         const responseData = await handleMcpMethod(method, params);
-        controller.enqueue(sseEvent(null, responseData));
+        controller.enqueue(sseEvent('message', jsonRpcResult(id, responseData)));
         controller.close();
       } catch (error: any) {
-        controller.enqueue(sseEvent(null, { error: error?.message || 'Internal error' }));
+        const message = error?.message || 'Internal error';
+        const err = jsonRpcError(null, message === 'Unknown method' ? -32601 : -32603, message);
+        controller.enqueue(sseEvent('message', err));
         controller.close();
       }
     }
