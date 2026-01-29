@@ -294,6 +294,7 @@ async function handleMcpMethod(method: string, params: any) {
     const { name, arguments: args } = params;
 
     const token = TODOIST_TOKEN;
+
     if (!token) {
       throw new Error('TODOIST_TOKEN is not set');
     }
@@ -705,6 +706,15 @@ async function handleMcpMethod(method: string, params: any) {
           }
         }
 
+  // Common MCP methods some clients probe for
+  else if (method === 'resources/list') {
+    responseData = { resources: [] };
+  }
+
+  else if (method === 'prompts/list') {
+    responseData = { prompts: [] };
+  }
+
 
   // Handle initialization/ping
   else if (method === 'initialize') {
@@ -800,7 +810,7 @@ export async function POST(req: NextRequest) {
       const err = jsonRpcError(null, -32700, error?.message || 'Parse error');
       controller.enqueue(sseEvent('message', err));
 		return Response.json(debug ? { ok: false, forwarded: err } : { ok: false }, {
-			status: 202,
+			status: 200,
 			headers: corsHeaders
 		});
     }
@@ -808,12 +818,26 @@ export async function POST(req: NextRequest) {
     const method = body?.method;
     const params = body?.params;
     const id: JsonRpcId = body?.id ?? null;
+    const hasId = !!body && Object.prototype.hasOwnProperty.call(body, 'id');
+
+    // JSON-RPC notifications have no id and must not receive a response.
+    if (!hasId) {
+      try {
+        // Some clients send notifications/initialized; ignore any result.
+        if (method) {
+          await handleMcpMethod(method, params);
+        }
+      } catch {
+        // swallow
+      }
+      return Response.json({ ok: true }, { status: 200, headers: corsHeaders });
+    }
 
     if (!method) {
     const err = jsonRpcError(id, -32600, 'Invalid Request');
     controller.enqueue(sseEvent('message', err));
     return Response.json(debug ? { ok: false, forwarded: err } : { ok: false }, {
-      status: 202,
+      status: 200,
       headers: corsHeaders
     });
     }
@@ -823,7 +847,7 @@ export async function POST(req: NextRequest) {
     const okMsg = jsonRpcResult(id, result);
     controller.enqueue(sseEvent('message', okMsg));
     return Response.json(debug ? { ok: true, forwarded: okMsg } : { ok: true }, {
-      status: 202,
+      status: 200,
       headers: corsHeaders
     });
     } catch (error: any) {
@@ -832,7 +856,7 @@ export async function POST(req: NextRequest) {
     const err = jsonRpcError(id, code, message);
     controller.enqueue(sseEvent('message', err));
     return Response.json(debug ? { ok: false, forwarded: err } : { ok: false }, {
-      status: 202,
+      status: 200,
       headers: corsHeaders
     });
     }
