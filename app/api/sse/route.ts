@@ -16,7 +16,65 @@ type JsonRpcRequest = {
 
 const encoder = new TextEncoder();
 
-const sessions = new Map<string, ReadableStreamDefaultController<Uint8Array>>();
+// In serverless environments, GET and POST may hit different instances.
+// Use a queue (Upstash/Vercel KV) so GET can poll and stream messages reliably.
+const inMemoryQueues = new Map<string, string[]>();
+
+function normalizeEnv(value: string | undefined) {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  const unquoted =
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'") )
+      ? trimmed.slice(1, -1)
+      : trimmed;
+  return unquoted.endsWith('/') ? unquoted.slice(0, -1) : unquoted;
+}
+
+const UPSTASH_URL = normalizeEnv(process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL);
+const UPSTASH_TOKEN = normalizeEnv(process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN);
+
+async function upstashCmd(command: string, args: Array<string | number> = []) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
+  const path = [command, ...args].map((a) => encodeURIComponent(String(a))).join('/');
+  const res = await fetch(`${UPSTASH_URL}/${path}`, {
+    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
+  });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+async function queuePush(sessionId: string, message: unknown) {
+  const payload = JSON.stringify(message);
+  const key = `mcp:sse:${sessionId}`;
+
+  // Prefer Upstash/Vercel KV if configured
+  const pushed = await upstashCmd('rpush', [key, payload]);
+  if (pushed) {
+    await upstashCmd('expire', [key, 600]);
+    return;
+  }
+
+  // Fallback: in-memory (works in dev / single instance)
+  const q = inMemoryQueues.get(sessionId) || [];
+  q.push(payload);
+  inMemoryQueues.set(sessionId, q);
+}
+
+async function queuePopMany(sessionId: string, max: number) {
+  const key = `mcp:sse:${sessionId}`;
+
+  const popped = await upstashCmd('lpop', [key, max]);
+  if (popped && Array.isArray(popped.result)) {
+    return popped.result as string[];
+  }
+
+  const q = inMemoryQueues.get(sessionId) || [];
+  if (q.length === 0) return [];
+  const out = q.splice(0, max);
+  if (q.length === 0) inMemoryQueues.delete(sessionId);
+  return out;
+}
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -706,6 +764,20 @@ async function handleMcpMethod(method: string, params: any) {
           }
         }
 
+  // Some clients send notifications as requests (id:null) or without id.
+  else if (method === 'notifications/initialized') {
+    responseData = {};
+  }
+
+  // Common MCP methods some clients probe for
+  else if (method === 'resources/list') {
+    responseData = { resources: [] };
+  }
+
+  else if (method === 'prompts/list') {
+    responseData = { prompts: [] };
+  }
+
   // Common MCP methods some clients probe for
   else if (method === 'resources/list') {
     responseData = { resources: [] };
@@ -750,16 +822,30 @@ export async function GET(req: NextRequest) {
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      sessions.set(sessionId, controller);
-
       // MCP SSE handshake: provide the message endpoint.
-		const endpointUrl = `${req.nextUrl.origin}${req.nextUrl.pathname}?sessionId=${encodeURIComponent(sessionId)}`;
-      controller.enqueue(
-		sseEvent('endpoint', endpointUrl)
-      );
+      const endpointUrl = `${req.nextUrl.origin}${req.nextUrl.pathname}?sessionId=${encodeURIComponent(sessionId)}`;
+      controller.enqueue(sseEvent('endpoint', endpointUrl));
       controller.enqueue(sseComment('connected'));
 
-      const interval = setInterval(() => {
+      let draining = false;
+      const drainInterval = setInterval(async () => {
+        if (draining) return;
+        draining = true;
+        try {
+          const items = await queuePopMany(sessionId, 50);
+          for (const raw of items) {
+            try {
+              controller.enqueue(sseEvent('message', JSON.parse(raw)));
+            } catch {
+              // ignore malformed queued items
+            }
+          }
+        } finally {
+          draining = false;
+        }
+      }, 250);
+
+      const pingInterval = setInterval(() => {
         try {
           controller.enqueue(sseComment('ping'));
         } catch {
@@ -767,10 +853,9 @@ export async function GET(req: NextRequest) {
         }
       }, 15000);
 
-      // Cleanup when client disconnects
       const abort = () => {
-        clearInterval(interval);
-        sessions.delete(sessionId);
+        clearInterval(drainInterval);
+        clearInterval(pingInterval);
         try {
           controller.close();
         } catch {
@@ -780,7 +865,7 @@ export async function GET(req: NextRequest) {
       req.signal.addEventListener('abort', abort, { once: true });
     },
     cancel() {
-      sessions.delete(sessionId);
+      // no-op
     }
   });
 
@@ -793,22 +878,14 @@ export async function POST(req: NextRequest) {
   const sessionId = req.nextUrl.searchParams.get('sessionId');
 	const debug = req.nextUrl.searchParams.get('debug') === '1';
 
-  // If we have a sessionId, this is a message POST that should be forwarded to an existing SSE stream.
+  // If we have a sessionId, this is a message POST that should be queued for the SSE stream.
   if (sessionId) {
-    const controller = sessions.get(sessionId);
-    if (!controller) {
-      return Response.json(
-        { error: 'Unknown or expired sessionId' },
-		{ status: 410, headers: corsHeaders }
-      );
-    }
-
     let body: JsonRpcRequest | null = null;
     try {
       body = (await parseJsonBody(req)) as JsonRpcRequest;
     } catch (error: any) {
       const err = jsonRpcError(null, -32700, error?.message || 'Parse error');
-      controller.enqueue(sseEvent('message', err));
+		await queuePush(sessionId, err);
 		return Response.json(debug ? { ok: false, forwarded: err } : { ok: false }, {
 			status: 200,
 			headers: corsHeaders
@@ -835,7 +912,7 @@ export async function POST(req: NextRequest) {
 
     if (!method) {
     const err = jsonRpcError(id, -32600, 'Invalid Request');
-    controller.enqueue(sseEvent('message', err));
+		await queuePush(sessionId, err);
     return Response.json(debug ? { ok: false, forwarded: err } : { ok: false }, {
       status: 200,
       headers: corsHeaders
@@ -845,7 +922,7 @@ export async function POST(req: NextRequest) {
     try {
       const result = await handleMcpMethod(method, params);
     const okMsg = jsonRpcResult(id, result);
-    controller.enqueue(sseEvent('message', okMsg));
+		await queuePush(sessionId, okMsg);
     return Response.json(debug ? { ok: true, forwarded: okMsg } : { ok: true }, {
       status: 200,
       headers: corsHeaders
@@ -854,7 +931,7 @@ export async function POST(req: NextRequest) {
       const message = error?.message || 'Internal error';
       const code = message === 'Unknown method' ? -32601 : -32603;
     const err = jsonRpcError(id, code, message);
-    controller.enqueue(sseEvent('message', err));
+		await queuePush(sessionId, err);
     return Response.json(debug ? { ok: false, forwarded: err } : { ok: false }, {
       status: 200,
       headers: corsHeaders
