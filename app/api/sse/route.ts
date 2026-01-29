@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
 
-export const runtime = 'edge';
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 const TODOIST_TOKEN = process.env.TODOIST_TOKEN;
 const TODOIST_API = 'https://api.todoist.com/rest/v2';
@@ -16,6 +17,23 @@ type JsonRpcRequest = {
 const encoder = new TextEncoder();
 
 const sessions = new Map<string, ReadableStreamDefaultController<Uint8Array>>();
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+  'Access-Control-Allow-Headers': 'content-type'
+} as const;
+
+function sseHeaders() {
+  return {
+    ...corsHeaders,
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+    'Content-Encoding': 'none'
+  } as Record<string, string>;
+}
 
 function sse(data: string) {
   return encoder.encode(data);
@@ -713,6 +731,10 @@ async function handleMcpMethod(method: string, params: any) {
   return responseData;
 }
 
+export async function OPTIONS() {
+	return new Response(null, { status: 204, headers: corsHeaders });
+}
+
 export async function GET(req: NextRequest) {
   const sessionId = crypto.randomUUID();
 
@@ -721,8 +743,9 @@ export async function GET(req: NextRequest) {
       sessions.set(sessionId, controller);
 
       // MCP SSE handshake: provide the message endpoint.
+		const endpointUrl = `${req.nextUrl.origin}${req.nextUrl.pathname}?sessionId=${encodeURIComponent(sessionId)}`;
       controller.enqueue(
-        sseEvent('endpoint', `/api/sse?sessionId=${encodeURIComponent(sessionId)}`)
+		sseEvent('endpoint', endpointUrl)
       );
       controller.enqueue(sseComment('connected'));
 
@@ -752,16 +775,13 @@ export async function GET(req: NextRequest) {
   });
 
   return new Response(stream, {
-    headers: {
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-cache, no-transform',
-      Connection: 'keep-alive'
-    }
+	headers: sseHeaders()
   });
 }
 
 export async function POST(req: NextRequest) {
   const sessionId = req.nextUrl.searchParams.get('sessionId');
+	const debug = req.nextUrl.searchParams.get('debug') === '1';
 
   // If we have a sessionId, this is a message POST that should be forwarded to an existing SSE stream.
   if (sessionId) {
@@ -769,7 +789,7 @@ export async function POST(req: NextRequest) {
     if (!controller) {
       return Response.json(
         { error: 'Unknown or expired sessionId' },
-        { status: 410 }
+		{ status: 410, headers: corsHeaders }
       );
     }
 
@@ -779,7 +799,10 @@ export async function POST(req: NextRequest) {
     } catch (error: any) {
       const err = jsonRpcError(null, -32700, error?.message || 'Parse error');
       controller.enqueue(sseEvent('message', err));
-      return Response.json({ ok: false }, { status: 202 });
+		return Response.json(debug ? { ok: false, forwarded: err } : { ok: false }, {
+			status: 202,
+			headers: corsHeaders
+		});
     }
 
     const method = body?.method;
@@ -787,20 +810,32 @@ export async function POST(req: NextRequest) {
     const id: JsonRpcId = body?.id ?? null;
 
     if (!method) {
-      controller.enqueue(sseEvent('message', jsonRpcError(id, -32600, 'Invalid Request')));
-      return Response.json({ ok: false }, { status: 202 });
+    const err = jsonRpcError(id, -32600, 'Invalid Request');
+    controller.enqueue(sseEvent('message', err));
+    return Response.json(debug ? { ok: false, forwarded: err } : { ok: false }, {
+      status: 202,
+      headers: corsHeaders
+    });
     }
 
     try {
       const result = await handleMcpMethod(method, params);
-      controller.enqueue(sseEvent('message', jsonRpcResult(id, result)));
+    const okMsg = jsonRpcResult(id, result);
+    controller.enqueue(sseEvent('message', okMsg));
+    return Response.json(debug ? { ok: true, forwarded: okMsg } : { ok: true }, {
+      status: 202,
+      headers: corsHeaders
+    });
     } catch (error: any) {
       const message = error?.message || 'Internal error';
       const code = message === 'Unknown method' ? -32601 : -32603;
-      controller.enqueue(sseEvent('message', jsonRpcError(id, code, message)));
+    const err = jsonRpcError(id, code, message);
+    controller.enqueue(sseEvent('message', err));
+    return Response.json(debug ? { ok: false, forwarded: err } : { ok: false }, {
+      status: 202,
+      headers: corsHeaders
+    });
     }
-
-    return Response.json({ ok: true }, { status: 202 });
   }
 
   // Back-compat: direct POST that returns a single SSE response and closes.
@@ -824,10 +859,6 @@ export async function POST(req: NextRequest) {
   });
 
   return new Response(stream, {
-    headers: {
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-cache, no-transform',
-      Connection: 'keep-alive'
-    }
+	headers: sseHeaders()
   });
 }
